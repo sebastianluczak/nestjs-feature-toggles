@@ -1,6 +1,7 @@
 import { Injectable, Logger, OnModuleInit } from "@nestjs/common";
 import { DiscoveryService, Reflector } from "@nestjs/core";
-import { FEATURE_TOGGLE_KEY, FEATURE_TOGGLE_PROVIDER } from "./feature-toggles.decorator";
+import { FEATURE_FLAG_KEY, FEATURE_FLAG_CONSUMER_KEY } from "./feature-toggles.decorator";
+import { FeatureTogglesClient } from "./feature-toggles.client";
 
 @Injectable()
 export class FeatureToggleScanner implements OnModuleInit {
@@ -9,50 +10,54 @@ export class FeatureToggleScanner implements OnModuleInit {
   constructor(
     private readonly discovery: DiscoveryService,
     private readonly reflector: Reflector,
+    private readonly client: FeatureTogglesClient,
   ) {}
 
   onModuleInit() {
-    this.logger.log(`Starting feature toggle scan for ${FEATURE_TOGGLE_PROVIDER} providers...`);
     for (const wrapper of this.discovery.getProviders()) {
       if (
         !wrapper.metatype ||
-        !this.reflector.get(
-          FEATURE_TOGGLE_PROVIDER,
-          wrapper.metatype,
-        )
+        !this.reflector.get(FEATURE_FLAG_CONSUMER_KEY, wrapper.metatype)
       ) {
         continue;
       }
 
-      const metadata = this.reflector.get(
-        FEATURE_TOGGLE_PROVIDER,
-        wrapper.metatype,
-      );
+      const instance = wrapper.instance as Record<string, unknown>;
+      if (!instance) continue;
 
-      if (metadata) {
-        this.logger.log(`FOUND: ${wrapper.name}`);
-        const instance = wrapper.instance;
-        const prototype = Object.getPrototypeOf(instance);
-        this.logger.log(`Prototype of ${wrapper.name}: ${prototype ? 'exists' : 'does not exist'}`);
+      const prototype = Object.getPrototypeOf(instance) as object;
+      if (!prototype) continue;
 
-        for (const methodName of Object.getOwnPropertyNames(prototype)) {
-          this.logger.log(`Checking method: ${methodName} of provider: ${wrapper.name}`);
-          const method = prototype[methodName];
+      for (const methodName of Object.getOwnPropertyNames(prototype)) {
+        if (methodName === 'constructor') continue;
 
-          try {
-            const toggle = this.reflector.get(
-              FEATURE_TOGGLE_KEY,
-              method,
+        const method = (prototype as Record<string, unknown>)[methodName];
+        if (typeof method !== 'function') continue;
+
+        const toggleMetadata = this.reflector.get<{ featureName: string; toggleType: 'release' | 'experiment' | 'ops' }>(
+          FEATURE_FLAG_KEY,
+          method,
+        );
+        if (!toggleMetadata) continue;
+
+        const { featureName, toggleType } = toggleMetadata;
+        // Bind to the instance so `this` works correctly inside the original method
+        const originalMethod = (method as (...args: unknown[]) => unknown).bind(instance);
+
+        this.logger.log(
+          `Wrapping ${String(wrapper.name)}.${methodName} behind feature flag '${featureName}' (${toggleType})`,
+        );
+
+        // Replace the method on the instance (not the prototype) with a gated version
+        instance[methodName] = (...args: unknown[]) => {
+          if (!this.client.getToggle(featureName, toggleType)) {
+            this.logger.debug(
+              `Feature '${featureName}' is disabled — skipping ${String(wrapper.name)}.${methodName}`,
             );
-            this.logger.log(
-              `${wrapper.name}.${methodName} uses`,
-              toggle,
-            );
-          } catch (error) {
-            this.logger.error(`Error retrieving metadata for method: ${methodName} of provider: ${wrapper.name}`, error);
-            continue;
+            return;
           }
-        }
+          return originalMethod(...args);
+        };
       }
     }
   }
