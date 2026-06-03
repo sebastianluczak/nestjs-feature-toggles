@@ -41,14 +41,11 @@ export class FeatureToggleScanner implements OnModuleInit {
         if (!toggleMetadata) continue;
 
         const { featureName, toggleType } = toggleMetadata;
-        // Bind to the instance so `this` works correctly inside the original method
         const originalMethod = (method as (...args: unknown[]) => unknown).bind(instance);
 
         this.logger.log(
           `Wrapping ${String(wrapper.name)}.${methodName} behind feature flag '${featureName}' (${toggleType})`,
         );
-
-        // Replace the method on the instance (not the prototype) with a gated version
         instance[methodName] = (...args: unknown[]) => {
           if (!this.client.getToggle(featureName, toggleType)) {
             this.logger.debug(
